@@ -114,23 +114,38 @@ inline void civil_from_days(i64 z, int& y, int& m, int& d) {
     y += (m <= 2);
 }
 
+// Read-only cache for dates near the declared input window.
+struct DateSlot { u32 key = 0; i64 day = 0; };
+inline DateSlot fast_dates[256];
+inline u32 date_cache_slot(u32 key) { return (key * 2654435761u) >> 24; }
+inline void prepare_dates(i64 start, i64 end) {
+    for (auto& slot : fast_dates) slot.key = 0;
+    i64 lo = floor_div(start, DAY_MS) - 10;
+    i64 hi = floor_div(end, DAY_MS) + 10;
+    // Limit the cache to a compact range; all other dates use exact conversion.
+    if (hi - lo > 200) hi = lo + 200;
+    for (i64 day = lo; day <= hi; ++day) {
+        int y, m, d;
+        civil_from_days(day, y, m, d);
+        if (y < 1 || y > 9999) continue;
+        u32 key = (u32)y * 512 + (u32)m * 32 + (u32)d;
+        fast_dates[date_cache_slot(key)] = {key, day};
+    }
+}
 // F1 (UTC), F2 (offset) or F3 (epoch millis). Anything else is invalid.
 inline bool parse_ts(const char* s, size_t n, i64& t) {
     using namespace detail;
     if (n == 0) return false;
-    size_t i = 0;
-    while (i < n && ascii_digit(s[i])) ++i;
-    if (i == n) {
+    if ((n != 20 && n != 25) || s[4] != '-') {
         i64 v = 0;
         for (size_t k = 0; k < n; ++k) {
-            int dg = s[k] - '0';
-            if (v > (INT64_MAX - dg) / 10) return false;
+            unsigned dg = (unsigned char)s[k] - (unsigned)'0';
+            if (dg > 9 || v > (INT64_MAX - (i64)dg) / 10) return false;
             v = v * 10 + dg;
         }
         t = v;
         return true;
     }
-    if (n != 20 && n != 25) return false;
     if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':') return false;
     static const int digit_pos[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
     for (int p : digit_pos)
@@ -148,8 +163,29 @@ inline bool parse_ts(const char* s, size_t n, i64& t) {
         if (oh < 0 || oh > 23 || om < 0 || om > 59) return false;
         off = (oh * 60 + om) * (s[19] == '+' ? 1 : -1);
     }
-    t = days_from_civil(y, (unsigned)m, (unsigned)d) * DAY_MS + (i64)h * 3600000 + (i64)mi * 60000 +
+    u32 date_key = (u32)y * 512 + (u32)m * 32 + (u32)d;
+    const DateSlot& slot = fast_dates[date_cache_slot(date_key)];
+    i64 day = slot.key == date_key ? slot.day : days_from_civil(y, (unsigned)m, (unsigned)d);
+    t = day * DAY_MS + (i64)h * 3600000 + (i64)mi * 60000 +
         (i64)se * 1000 - (i64)off * 60000;
+    return true;
+}
+
+// Ingestion timestamps are guaranteed to be valid F1 by the input rules.
+inline bool parse_ingest_f1(const char* s, size_t n, i64& t) {
+    if (n != 20 || s[19] != 'Z') return parse_ts(s, n, t);
+    int y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + s[3] - '0';
+    int m = (s[5] - '0') * 10 + s[6] - '0';
+    int d = (s[8] - '0') * 10 + s[9] - '0';
+    int h = (s[11] - '0') * 10 + s[12] - '0';
+    int mi = (s[14] - '0') * 10 + s[15] - '0';
+    int se = (s[17] - '0') * 10 + s[18] - '0';
+    if (y < 1 || y > 9999 || m < 1 || m > 12 || d < 1 || d > detail::month_days(y,m))
+        return parse_ts(s,n,t);
+    u32 key = (u32)y * 512 + (u32)m * 32 + (u32)d;
+    const DateSlot& slot = fast_dates[date_cache_slot(key)];
+    i64 day = slot.key == key ? slot.day : days_from_civil(y, (unsigned)m, (unsigned)d);
+    t = day * DAY_MS + (i64)h * 3600000 + (i64)mi * 60000 + (i64)se * 1000;
     return true;
 }
 

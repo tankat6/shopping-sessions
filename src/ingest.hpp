@@ -62,7 +62,7 @@ inline void parse_event_line(const char* p, size_t len, ThreadData& td, const In
     r.ev = make_key(f[0].p, f[0].n);
     i64 ts = NO_TIME, ing;
     bool ts_ok = parse_ts(f[2].p, f[2].n, ts) && ts >= c.window.start && ts < c.window.end;
-    if (!parse_ts(f[3].p, f[3].n, ing)) ing = NO_TIME;
+    if (!parse_ingest_f1(f[3].p, f[3].n, ing)) ing = NO_TIME;
     u32 kind = 0, price = 0;
     const Field& ty = f[4];
     if (ty.n == 4 && std::memcmp(ty.p, "view", 4) == 0) kind = 1;

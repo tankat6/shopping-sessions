@@ -57,6 +57,7 @@ int main(int argc, char** argv) {
 
         // --- references and links
         Window win = load_manifest(data + "/manifest.json");
+        prepare_dates(win.start, win.end);
         Products products;
         products.load(data + "/products.csv");
         Campaigns campaigns;
