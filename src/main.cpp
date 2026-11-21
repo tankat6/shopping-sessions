@@ -234,7 +234,10 @@ int main(int argc, char** argv) {
                     while ((st = dict_state.load(std::memory_order_acquire)) == 0) std::this_thread::yield();
                     if (st == 2) return;  // the build failed; its exception is rethrown by parallel_jobs
                     readers[t].for_each_record<4>(click_files[cc[job.idx].file], cmaps[cc[job.idx].file], cc[job.idx],
-                                                  [&](const char* p, size_t n, const Cols<4>& c) { parse_click_line(p, n, c, td[t], ic, tmp[t]); });
+                                                  [&](const char* p, size_t n, const Cols<4>& c) {
+                                                      parse_click_line(p, n, c, td[t], ic, tmp[t]);
+                                                      if (tmp[t].size() >= CLICK_BATCH) emit_clicks(td[t], ic, tmp[t]);
+                                                  });
                     emit_clicks(td[t], ic, tmp[t]);
                 }
             });

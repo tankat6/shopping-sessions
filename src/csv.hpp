@@ -127,10 +127,11 @@ namespace detail {
 // Days since the epoch of the first day of each month, 1970..2199.
 constexpr int TBL_Y0 = 1970, TBL_YN = 230;
 struct MonthStarts {
-    std::int32_t d[TBL_YN * 12];
+    std::int32_t d[TBL_YN * 12 + 1];  // the extra entry is the start of the month after the table
     constexpr MonthStarts() : d() {
         for (int y = 0; y < TBL_YN; ++y)
             for (int m = 0; m < 12; ++m) d[y * 12 + m] = (std::int32_t)days_from_civil(TBL_Y0 + y, (unsigned)m + 1, 1);
+        d[TBL_YN * 12] = (std::int32_t)days_from_civil(TBL_Y0 + TBL_YN, 1, 1);
     }
 };
 inline constexpr MonthStarts g_month_starts{};
@@ -230,7 +231,7 @@ inline bool parse_digits16(const char* s, size_t n, u64& v) {
 // Needs 32 readable bytes at s.
 inline bool parse_ts(const char* s, size_t n, i64& t) {
     using namespace detail;
-    if (n == 0) return false;
+    // One data-dependent branch separates the ISO forms from the rest.
     if ((n == 20 || n == 25) && s[4] == '-') {
         const __m128i zero = _mm_setzero_si128();
         const __m128i c0 = _mm_set1_epi8('0'), c9 = _mm_set1_epi8(9);
@@ -246,29 +247,51 @@ inline bool parse_ts(const char* s, size_t n, i64& t) {
         constexpr u32 PUNCT = (1u << 4) | (1u << 7) | (1u << 10) | (1u << 13);
         // b[0] is s[16] ':' ; b[1], b[2] are the seconds digits.
         if ((dm & DIGITS) != DIGITS || (em & PUNCT) != PUNCT || (emb & 1u) != 1u || (dmb & 6u) != 6u) return false;
-        // Gather YYYY MM DD hh mm ss into one vector and fold digit pairs.
+        // Gather YYYY MM DD hh mm ss into one vector and fold digit pairs into 16-bit lanes
+        // [YY, yy, MM, DD, hh, mm, ss, 0].
         const __m128i ga = _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128);
         const __m128i gb = _mm_setr_epi8(-128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, 1, 2,
                                          -128, -128);
         __m128i dg = _mm_or_si128(_mm_shuffle_epi8(da, ga), _mm_shuffle_epi8(db, gb));
         __m128i w = _mm_maddubs_epi16(dg, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
-        u64 lo = (u64)_mm_cvtsi128_si64(w), hi = (u64)_mm_extract_epi64(w, 1);
-        int y = (int)((lo & 0xFFFF) * 100 + ((lo >> 16) & 0xFFFF));
-        int m = (int)((lo >> 32) & 0xFFFF), dd = (int)(lo >> 48);
-        int h = (int)(hi & 0xFFFF), mi = (int)((hi >> 16) & 0xFFFF), se = (int)((hi >> 32) & 0xFFFF);
-        if (y < 1 || m < 1 || m > 12 || dd < 1 || h > 23 || mi > 59 || se > 59) return false;
-        if (dd > 28 && dd > month_days(y, m)) return false;
+        // All field ranges in one test: month 1-12, day 1-31, hour <= 23, minute and second <= 59.
+        const __m128i vmax = _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0x7FFF);
+        const __m128i vmin = _mm_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0);
+        __m128i oob = _mm_or_si128(_mm_cmpgt_epi16(w, vmax), _mm_cmpgt_epi16(vmin, w));
+        if (_mm_movemask_epi8(oob)) return false;
+        // hh*3600 + mm*60 + ss in one multiply-add.
+        __m128i tm = _mm_madd_epi16(w, _mm_setr_epi16(0, 0, 0, 0, 3600, 60, 1, 0));
+        u64 tt = (u64)_mm_extract_epi64(tm, 1);
+        const i64 secs = (i64)(u32)tt + (i64)(tt >> 32);
+        u64 lo = (u64)_mm_cvtsi128_si64(w);
+        const int y = (int)((lo & 0xFFFF) * 100 + ((lo >> 16) & 0xFFFF));
+        const int m = (int)((lo >> 32) & 0xFFFF), dd = (int)(lo >> 48);
         // Zone: 'Z' (n == 20) or +hh:mm / -hh:mm (n == 25), selected without branching.
         const bool is_off = n == 25;
         const char sg = s[19];
-        int oh = (s[20] - '0') * 10 + (s[21] - '0'), om = (s[23] - '0') * 10 + (s[24] - '0');
-        bool ok_z = sg == 'Z';
-        bool ok_off = (sg == '+' || sg == '-') && ((emb >> 6) & 1u) && ((dmb & 0x1B0u) == 0x1B0u) && oh <= 23 && om <= 59;
+        __m128i oz = _mm_maddubs_epi16(_mm_shuffle_epi8(db, _mm_setr_epi8(4, 5, 7, 8, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128)),
+                                       _mm_setr_epi8(10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+        const u32 ox = (u32)_mm_cvtsi128_si32(oz);
+        const u32 oh = ox & 0xFFFF, om = ox >> 16;
+        const bool ok_z = sg == 'Z';
+        const bool ok_off = (sg == '+' || sg == '-') & (bool)((emb >> 6) & 1u) & ((dmb & 0x1B0u) == 0x1B0u) & (oh <= 23) & (om <= 59);
         if (!(is_off ? ok_off : ok_z)) return false;
-        int off = is_off ? (oh * 60 + om) * (sg == '+' ? 1 : -1) : 0;
-        t = days_ymd(y, m, dd) * DAY_MS + (i64)h * 3600000 + (i64)mi * 60000 + (i64)se * 1000 - (i64)off * 60000;
+        const i64 off = is_off ? (i64)(oh * 60 + om) * (sg == '+' ? 1 : -1) : 0;
+        // Month start from the table; the next entry gives the month length (checks the day exactly).
+        i64 days;
+        const unsigned yi = (unsigned)(y - TBL_Y0);
+        if (__builtin_expect(yi < (unsigned)TBL_YN, 1)) {
+            const std::int32_t* ms = g_month_starts.d + yi * 12 + (unsigned)(m - 1);
+            if (dd > ms[1] - ms[0]) return false;
+            days = (i64)ms[0] + dd - 1;
+        } else {
+            if (y < 1 || dd > month_days(y, m)) return false;
+            days = days_from_civil(y, (unsigned)m, (unsigned)dd);
+        }
+        t = days * DAY_MS + secs * 1000 - off * 60000;
         return true;
     }
+    if (n == 0) return false;
     if (n <= 16) {
         u64 v;
         if (!parse_digits16(s, n, v)) return false;

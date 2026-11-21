@@ -55,6 +55,9 @@ inline void parse_event_line(const char* p, size_t len, const Cols<7>& cols, Thr
                              const IngestContext& c) {
     Field f[7];
     PROBE_BEGIN(a0);
+// Profiling hooks (ABL_NOFIELDS / ABL_NOTS / ABL_NOSHUF): each skips one phase so the
+// cost of that phase can be read from the parse-stage time. Output is invalid when
+// they are set; see scripts/ablation_benchmark.py.
 #ifdef ABL_NOFIELDS
     td.event_lines += cols.comma[3] & 1; return;
 #endif
@@ -126,6 +129,9 @@ inline void parse_link_line(const char* p, size_t len, const Cols<2>& cols, Thre
     }
     td.links.push_back(LinkPair{make_key(f[0].p, f[0].n), make_key(f[1].p, f[1].n)});
 }
+
+// Clicks are resolved in small batches so the temporary records stay in L1.
+inline constexpr size_t CLICK_BATCH = 256;
 
 struct ClickTmp {
     Key user, cid;
