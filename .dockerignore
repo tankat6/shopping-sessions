@@ -1,5 +1,11 @@
 fixtures/
-dev/
-out/
+dev-answer/
+generator/
+docs/
+tests/
+scripts/
 *.md
 .git
+bench-*/
+dev-*/
+out/

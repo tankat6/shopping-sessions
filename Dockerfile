@@ -1,25 +1,15 @@
-# Build the native CSV parser.
-FROM debian:bookworm-slim AS native-builder
+# Build a static native binary.
+FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ \
     && rm -rf /var/lib/apt/lists/*
-COPY native/fast_csv.cpp /src/fast_csv.cpp
-RUN g++ -O3 -std=c++17 -pthread -static -s /src/fast_csv.cpp -o /fast_csv
+WORKDIR /src
+COPY src/ src/
+RUN g++ -O3 -std=c++20 -mavx2 -mbmi2 -mpopcnt -pthread -static -s \
+    src/main.cpp -o /shopping_sessions
 
-# Runtime image.
-FROM python:3.12-slim-bookworm
-
+# Runtime image: no interpreter, no libraries, nothing to import at startup.
+FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY --from=native-builder /fast_csv /app/pipeline/fast_csv
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
+COPY --from=build /shopping_sessions /app/shopping_sessions
 WORKDIR /app
-CMD ["/app/run.sh"]
+CMD ["/app/shopping_sessions"]
