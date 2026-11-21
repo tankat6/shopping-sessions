@@ -1,0 +1,28 @@
+# Local data and outputs
+bench-data/
+bench-output/
+bench-scratch/
+fast-output/
+fast-scratch/
+profile-output/
+profile-scratch/
+dev-data/
+dev-output/
+dev-scratch/
+docker-output/
+docker-scratch/
+dev/
+out/
+output/
+scratch/
+dev-answer/
+fixtures/
+# Build artifacts
+__pycache__/
+*.pyc
+*.parquet
+*.log
+*.egg-info/
+.DS_Store
+.vscode/
+.idea/
