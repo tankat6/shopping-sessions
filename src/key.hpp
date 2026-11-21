@@ -59,19 +59,23 @@ inline const Tables& tables() {
 }
 }  // namespace detail
 
-// Requires 16 readable bytes at p.
-inline Key make_key(const char* p, size_t n) {
-    if (n <= 15) {
-        const auto& t = detail::tables();
+Key make_long_key(const char* p, size_t n);
+
+// Requires 16 readable bytes at p. IDs up to 15 bytes become the zero-padded
+// bytes with the length in the last byte; the mask is computed in registers.
+[[gnu::always_inline]] inline Key make_key(const char* p, size_t n) {
+    if (__builtin_expect(n <= 15, 1)) {
+        const __m128i iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         __m128i v = _mm_loadu_si128((const __m128i*)p);
-        v = _mm_and_si128(v, _mm_load_si128((const __m128i*)t.mask[n]));
-        v = _mm_or_si128(v, _mm_load_si128((const __m128i*)t.len[n]));
+        v = _mm_and_si128(v, _mm_cmpgt_epi8(_mm_set1_epi8((char)n), iota));
+        v = _mm_or_si128(v, _mm_slli_si128(_mm_cvtsi32_si128((int)n), 15));
         Key k;
         _mm_storeu_si128((__m128i*)&k, v);
         return k;
     }
-    return long_strings().intern(std::string_view(p, n));
+    return make_long_key(p, n);
 }
+inline Key make_long_key(const char* p, size_t n) { return long_strings().intern(std::string_view(p, n)); }
 
 inline u64 hash_key(const Key& k) {
     u64 h = (k.a ^ 0x9E3779B97F4A7C15ull) * 0xFF51AFD7ED558CCDull;

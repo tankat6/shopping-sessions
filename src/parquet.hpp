@@ -88,23 +88,28 @@ private:
 
 class File {
 public:
-    File(std::string path, std::vector<ColumnSpec> cols) : path_(std::move(path)), spec_(std::move(cols)), col_(spec_.size()) {}
+    File(std::string path, std::vector<ColumnSpec> cols) : path_(std::move(path)), spec_(std::move(cols)) {
+        col_ = std::vector<Column>(spec_.size());
+    }
     ~File() {
         if (fd_ >= 0) ::close(fd_);
     }
 
     void add_i32(int c, i64 v) {
         i32_t x = (i32_t)v;
-        append(col_[c].vals, &x, 4);
+        col_[c].put(&x, 4);
     }
-    void add_i64(int c, i64 v) { append(col_[c].vals, &v, 8); }
+    void add_i64(int c, i64 v) { col_[c].put(&v, 8); }
     void add_str(int c, const char* p, size_t n) {
+        Column& col = col_[c];
         u32 len = (u32)n;
-        append(col_[c].vals, &len, 4);
-        append(col_[c].vals, p, n);
-        if (spec_[c].optional) col_[c].defs.push_back(1);
+        col.reserve(4 + n);
+        std::memcpy(col.data + col.size, &len, 4);
+        std::memcpy(col.data + col.size + 4, p, n);
+        col.size += 4 + n;
+        if (spec_[c].optional) col.set_def(rows_, true);
     }
-    void add_null(int c) { col_[c].defs.push_back(0); }
+    void add_null(int c) { col_[c].set_def(rows_, false); }
     void row_done() {
         if (++rows_ >= GROUP_ROWS) flush_group();
     }
@@ -124,9 +129,33 @@ public:
 
 private:
     using i32_t = std::int32_t;
-    static constexpr u32 GROUP_ROWS = 1u << 18;
+    static constexpr u32 GROUP_ROWS = 1u << 16;  // small groups keep the column buffers cache- and fault-friendly
+    // Plain value bytes plus a packed definition bitmap (1 = present).
     struct Column {
-        std::vector<u8> vals, defs;
+        u8* data = nullptr;
+        size_t size = 0, cap = 0;
+        std::vector<u8> defs;
+        Column() = default;
+        Column(const Column&) = delete;
+        Column(Column&& o) noexcept : data(o.data), size(o.size), cap(o.cap), defs(std::move(o.defs)) { o.data = nullptr; }
+        ~Column() { std::free(data); }
+        void reserve(size_t extra) {
+            if (size + extra <= cap) return;
+            size_t ncap = std::max(size + extra, cap ? cap * 2 : (size_t)1 << 16);
+            u8* nd = (u8*)std::realloc(data, ncap);
+            if (!nd) throw std::bad_alloc();
+            data = nd;
+            cap = ncap;
+        }
+        void put(const void* p, size_t n) {
+            reserve(n);
+            std::memcpy(data + size, p, n);
+            size += n;
+        }
+        void set_def(u64 row, bool present) {
+            if ((row >> 3) >= defs.size()) defs.push_back(0);
+            if (present) defs[row >> 3] |= (u8)(1u << (row & 7));
+        }
     };
     struct ChunkMeta {
         i64 offset, total_size, uncompressed, values;
@@ -155,13 +184,17 @@ private:
         append(out_, "PAR1", 4);
         pos_ = 4;
     }
-    void flush_out() {
+    void write_all(const void* p, size_t n) {
+        const u8* b = (const u8*)p;
         size_t done = 0;
-        while (done < out_.size()) {
-            ssize_t w = ::write(fd_, out_.data() + done, out_.size() - done);
+        while (done < n) {
+            ssize_t w = ::write(fd_, b + done, n - done);
             if (w < 0) throw std::runtime_error("write failed " + path_);
             done += (size_t)w;
         }
+    }
+    void flush_out() {
+        write_all(out_.data(), out_.size());
         out_.clear();
     }
 
@@ -177,15 +210,12 @@ private:
                 size_t groups = (rows_ + 7) / 8;
                 Thrift h;
                 h.varint((groups << 1) | 1);
-                std::vector<u8> packed(groups, 0);
-                for (size_t i = 0; i < rows_; ++i)
-                    if (col.defs[i]) packed[i >> 3] |= (u8)(1u << (i & 7));
-                u32 len = (u32)(h.buf.size() + packed.size());
+                u32 len = (u32)(h.buf.size() + groups);
                 append(levels, &len, 4);
                 append(levels, h.buf.data(), h.buf.size());
-                append(levels, packed.data(), packed.size());
+                append(levels, col.defs.data(), groups);
             }
-            i64 page = (i64)(levels.size() + col.vals.size());
+            i64 page = (i64)(levels.size() + col.size);
             Thrift t;
             t.begin();
             t.i32(1, 0);  // DATA_PAGE
@@ -200,16 +230,18 @@ private:
             t.end();
             ChunkMeta m;
             m.offset = pos_;
+            // Page header and levels are small; the column data is written in place.
             append(out_, t.buf.data(), t.buf.size());
             append(out_, levels.data(), levels.size());
-            append(out_, col.vals.data(), col.vals.size());
+            flush_out();
+            write_all(col.data, col.size);
             m.total_size = (i64)t.buf.size() + page;
             m.uncompressed = m.total_size;
             m.values = (i64)rows_;
             pos_ += m.total_size;
             g.bytes += m.total_size;
             g.chunks.push_back(m);
-            col.vals.clear();
+            col.size = 0;
             col.defs.clear();
         }
         groups_.push_back(std::move(g));

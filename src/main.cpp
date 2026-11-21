@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <malloc.h>
 #include <memory>
 
 #include "process.hpp"
@@ -43,13 +44,24 @@ static u32 partition_bits(u64 est_rows) {
 int main(int argc, char** argv) {
     try {
 #ifdef __AVX2__
-        if (!__builtin_cpu_supports("avx2")) throw std::runtime_error("this build requires AVX2");
+        if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("bmi") || !__builtin_cpu_supports("bmi2") ||
+            !__builtin_cpu_supports("popcnt"))
+            throw std::runtime_error("this build requires AVX2, BMI1/2 and POPCNT");
 #endif
         std::string data = env_or("DATA_DIR", "/data"), out = env_or("OUTPUT_DIR", "/output");
         if (argc >= 3) {
             data = argv[1];
             out = argv[2];
         }
+        // Keep glibc from returning memory to the kernel or growing heaps in tiny steps:
+        // each such call takes the address-space lock exclusively (MALLOPT=0 disables).
+        if (!std::getenv("MALLOPT") || std::atoi(std::getenv("MALLOPT")) != 0) {
+            mallopt(M_MMAP_THRESHOLD, 32 << 20);
+            mallopt(M_TRIM_THRESHOLD, 1 << 30);
+            mallopt(M_TOP_PAD, 64 << 20);
+        }
+        if (const char* e = std::getenv("THP")) g_huge_pages = std::atoi(e) != 0;
+        pool_owner_slot();  // the main thread owns the persistent worker pool
         const int T = detect_threads();
         Profile prof;
         prof.verbose = !std::getenv("QUIET");
@@ -57,7 +69,6 @@ int main(int argc, char** argv) {
 
         // --- references and links
         Window win = load_manifest(data + "/manifest.json");
-        prepare_dates(win.start, win.end);
         Products products;
         products.load(data + "/products.csv");
         Campaigns campaigns;
@@ -71,15 +82,72 @@ int main(int argc, char** argv) {
         auto link_files = list_csv(data + "/links");
         auto event_files = list_csv(data + "/events");
         auto click_files = list_csv(data + "/clicks");
+        open_inputs(link_files);
+        open_inputs(event_files);
+        open_inputs(click_files);
+        // Input access: pread into per-thread buffers by default; INPUT=mmap maps the files instead.
         u64 CHUNK = 4u << 20;
         if (const char* e = std::getenv("CHUNK_BYTES")) CHUNK = std::max<u64>(1, std::strtoull(e, nullptr, 10));
+        // Diagnostic: how fast can this machine just read the input? IO_ONLY=1 preads every
+        // chunk, IO_ONLY=scan also counts newlines, IO_ONLY=mmap touches a mapping. Exits afterwards.
+        if (const char* io = std::getenv("IO_ONLY")) {
+            std::vector<InputFile> all;
+            for (auto* v : {&link_files, &event_files, &click_files})
+                for (auto& f : *v) all.push_back(f);
+            auto chunks = make_chunks(all, CHUNK);
+            const std::string mode = io;
+            std::atomic<u64> bytes{0}, lines{0};
+            std::vector<MappedFile> maps;
+            if (mode == "mmap")
+                for (auto& f : all) maps.push_back(map_file(f));
+            Stopwatch sw;
+            parallel_jobs(T, chunks.size(), [&](int, size_t j) {
+                const Chunk& c = chunks[j];
+                const size_t n = (size_t)(c.end - c.begin);
+                u64 cnt = 0;
+                if (mode == "mmap") {
+                    const char* p = maps[c.file].p;
+                    if (!p) return;
+                    ::madvise((void*)(p + (c.begin & ~4095ull)), (size_t)(c.end - (c.begin & ~4095ull)), MADV_POPULATE_READ);
+                    for (u64 o = c.begin; o < c.end; o += 4096) cnt += (u8)p[o];
+                } else {
+                    thread_local std::vector<char> buf;
+                    if (buf.size() < n) buf.resize(n);
+                    size_t got = 0;
+                    while (got < n) {
+                        ssize_t r = ::pread(all[c.file].fd, buf.data() + got, n - got, (off_t)(c.begin + got));
+                        if (r <= 0) break;
+                        got += (size_t)r;
+                    }
+                    if (mode == "scan")
+                        for (size_t o = 0; o < got;) {
+                            const void* q = std::memchr(buf.data() + o, '\n', got - o);
+                            if (!q) break;
+                            ++cnt;
+                            o = (size_t)((const char*)q - buf.data()) + 1;
+                        }
+                }
+                bytes += n;
+                lines += cnt;
+            });
+            double sec = sw.lap();
+            std::fprintf(stderr, "IO_FLOOR mode=%s threads=%d bytes=%.0f MB time=%.3fs rate=%.0f MB/s (checksum %llu)\n",
+                         io, T, (double)bytes / 1e6, sec, (double)bytes / 1e6 / sec, (unsigned long long)lines);
+            ::_exit(0);
+        }
+        const char* input_mode = std::getenv("INPUT");
+        const bool use_map = input_mode && std::strcmp(input_mode, "mmap") == 0;
         std::vector<ThreadData> td(T);
         {
             auto chunks = make_chunks(link_files, CHUNK);
+            std::vector<MappedFile> maps;
+            for (auto& f : link_files) maps.push_back(use_map ? map_file(f) : MappedFile{});
             std::vector<ChunkReader> readers(T);
             parallel_jobs(T, chunks.size(), [&](int t, size_t j) {
-                readers[t].for_each_line(link_files[chunks[j].file], chunks[j], [&](const char* p, size_t n) { parse_link_line(p, n, td[t]); });
+                readers[t].for_each_record<2>(link_files[chunks[j].file], maps[chunks[j].file], chunks[j],
+                                              [&](const char* p, size_t n, const Cols<2>& c) { parse_link_line(p, n, c, td[t]); });
             });
+            for (int t = 0; t < T; ++t) thread_stats().read_ns[t].fetch_add(readers[t].read_ns);
         }
         prof.mark("link_parse");
         std::vector<std::vector<LinkPair>> links(T);
@@ -88,11 +156,13 @@ int main(int argc, char** argv) {
             links[t] = std::move(td[t].links);
             link_count += links[t].size();
         }
+        // The identity dictionary is only needed once clicks are resolved, so it is
+        // built as one job beside the event chunks. It runs on a single worker (no
+        // extra threads, so never more runnable threads than CPUs) and the other
+        // workers keep parsing; dynamic scheduling balances the rest.
         LinkDict dict;
-        dict.build(links, T);
+        std::atomic<int> dict_state{0};  // 0 pending, 1 built, 2 failed
         prof.count("links", link_count);
-        prof.count("link_ids", dict.ids());
-        prof.mark("link_dict");
 
         // --- parse events and clicks
         u64 event_bytes = 0;
@@ -106,31 +176,71 @@ int main(int argc, char** argv) {
             t.s2e.resize(P2);
             t.s2c.resize(P2);
         }
+        // One reservation for all shuffle blocks (ARENA=0 falls back to per-thread slabs).
+        if (!std::getenv("ARENA") || std::atoi(std::getenv("ARENA")) != 0) {
+            u64 click_bytes = 0;
+            for (auto& f : click_files) click_bytes += f.size;
+            // Upper bound: shortest plausible rows, plus slack for block rounding and stride padding.
+            u64 need = (event_bytes / 48) * sizeof(E1) + (click_bytes / 24) * sizeof(C2);
+            need += need / 8 + ((u64)T << 24) + ((u64)P1 * 3 * T << 15);
+            need += link_count * 288 + (4ull << 20);  // dictionary tables: at most 8 slots of 32 bytes per link
+            if (!SlabSource::get().reserve((size_t)need)) std::fprintf(stderr, "note: arena reservation refused, using slabs\n");
+        }
         IngestContext ic{&products, &campaigns, &dict, win, p1_bits, p2_bits};
         {
             auto ec = make_chunks(event_files, CHUNK);
             auto cc = make_chunks(click_files, CHUNK);
             struct Job {
                 bool click;
+                bool dict;
                 size_t idx;
             };
             std::vector<Job> jobs;
-            for (size_t i = 0; i < ec.size(); ++i) jobs.push_back({false, i});
-            for (size_t i = 0; i < cc.size(); ++i) jobs.push_back({true, i});
+            jobs.push_back({false, true, 0});
+            for (size_t i = 0; i < ec.size(); ++i) jobs.push_back({false, false, i});
+            for (size_t i = 0; i < cc.size(); ++i) jobs.push_back({true, false, i});
+            std::vector<MappedFile> emaps, cmaps;
+            for (auto& f : event_files) emaps.push_back(use_map ? map_file(f) : MappedFile{});
+            for (auto& f : click_files) cmaps.push_back(use_map ? map_file(f) : MappedFile{});
             std::vector<ChunkReader> readers(T);
             std::vector<std::vector<ClickTmp>> tmp(T);
+            // Optional: ask the kernel to start reading a chunk several jobs ahead (ADVISE=1).
+            // Off by default: it showed no gain where it could be measured.
+            const bool advise = std::getenv("ADVISE") && std::atoi(std::getenv("ADVISE")) != 0;
+            const size_t look = (size_t)T * 2;
+            auto hint = [&](size_t j) {
+                if (!advise || use_map || j >= jobs.size() || jobs[j].dict) return;
+                const Job& jb = jobs[j];
+                const Chunk& ch = jb.click ? cc[jb.idx] : ec[jb.idx];
+                const InputFile& f = jb.click ? click_files[ch.file] : event_files[ch.file];
+                ::posix_fadvise(f.fd, (off_t)ch.begin, (off_t)(ch.end - ch.begin), POSIX_FADV_WILLNEED);
+            };
             parallel_jobs(T, jobs.size(), [&](int t, size_t j) {
+                hint(j + look);
                 const Job& job = jobs[j];
-                if (!job.click) {
-                    readers[t].for_each_line(event_files[ec[job.idx].file], ec[job.idx],
-                                             [&](const char* p, size_t n) { parse_event_line(p, n, td[t], ic); });
+                if (job.dict) {
+                    try {
+                        dict.build(links, 1);
+                    } catch (...) {
+                        dict_state.store(2, std::memory_order_release);
+                        throw;
+                    }
+                    dict_state.store(1, std::memory_order_release);
+                } else if (!job.click) {
+                    readers[t].for_each_record<7>(event_files[ec[job.idx].file], emaps[ec[job.idx].file], ec[job.idx],
+                                                  [&](const char* p, size_t n, const Cols<7>& c) { parse_event_line(p, n, c, td[t], ic); });
                 } else {
-                    readers[t].for_each_line(click_files[cc[job.idx].file], cc[job.idx],
-                                             [&](const char* p, size_t n) { parse_click_line(p, n, td[t], ic, tmp[t]); });
+                    int st;
+                    while ((st = dict_state.load(std::memory_order_acquire)) == 0) std::this_thread::yield();
+                    if (st == 2) return;  // the build failed; its exception is rethrown by parallel_jobs
+                    readers[t].for_each_record<4>(click_files[cc[job.idx].file], cmaps[cc[job.idx].file], cc[job.idx],
+                                                  [&](const char* p, size_t n, const Cols<4>& c) { parse_click_line(p, n, c, td[t], ic, tmp[t]); });
                     emit_clicks(td[t], ic, tmp[t]);
                 }
             });
+            for (int t = 0; t < T; ++t) thread_stats().read_ns[t].fetch_add(readers[t].read_ns);
         }
+        prof.count("link_ids", dict.ids());
         u64 ev_lines = 0, ev_bad = 0, cl_lines = 0, cl_bad = 0;
         for (auto& t : td) {
             ev_lines += t.event_lines;
@@ -163,7 +273,9 @@ int main(int argc, char** argv) {
         // --- sessions, attribution, aggregation, user_daily output
         const i64 base_day = floor_div(win.start, DAY_MS);
         const u32 ndays = (u32)(floor_div(win.end - 1, DAY_MS) - base_day + 1);
-        ProcessContext pc{&products, &campaigns, &dict, base_day, ndays, p2_bits};
+        auto bits_for = [](u64 values) { return values > 1 ? 64u - (u32)__builtin_clzll(values - 1) : 0u; };
+        ProcessContext pc{&products, &campaigns, &dict, base_day, ndays, p2_bits, win.start,
+                          bits_for((u64)(win.end - win.start)), bits_for((u64)(win.end - win.start + WEEK_MS))};
         std::vector<std::unique_ptr<PersonWorker>> workers;
         for (int t = 0; t < T; ++t)
             workers.emplace_back(new PersonWorker(pc, out + "/user_daily/part-" + std::to_string(t) + ".parquet", t == 0));
@@ -206,6 +318,18 @@ int main(int argc, char** argv) {
         });
         cf.finish(true);
         prof.mark("campaign_daily");
+#ifdef SS_PROFILE
+        {
+            Stopwatch w;
+            u64 a = __rdtsc();
+            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w.t0).count() < 0.2) {}
+            double hz = (double)(__rdtsc() - a) / 0.2;
+            const char* nm[] = {"dedup.table", "dedup.winners", "dedup.forward", "persons.number", "persons.sort",
+                                "persons.loop", "  person.sessions", "  person.clicks+attr", "  person.emit", "(unused)",
+                                "ev.split", "ev.ts+key", "ev.kind/price/prod", "ev.shuffle write", "click.parse(all)", "click.emit"};
+            for (int i = 0; i < 16; ++i) std::fprintf(stderr, "CYC %-22s %.3fs\n", nm[i], g_cycles[i] / hz);
+        }
+#endif
         if (prof.verbose) std::fprintf(stderr, "TOTAL %.3fs\n", prof.total.lap());
         // Outputs are closed; skip tearing down gigabytes of working memory.
         std::fflush(stderr);

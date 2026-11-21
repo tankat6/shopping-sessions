@@ -51,25 +51,48 @@ struct IngestContext {
     u32 p1_bits, p2_bits;
 };
 
-inline void parse_event_line(const char* p, size_t len, ThreadData& td, const IngestContext& c) {
+inline void parse_event_line(const char* p, size_t len, const Cols<7>& cols, ThreadData& td,
+                             const IngestContext& c) {
     Field f[7];
-    if (!split_line<7>(p, len, f) || f[0].n == 0) {
+    PROBE_BEGIN(a0);
+#ifdef ABL_NOFIELDS
+    td.event_lines += cols.comma[3] & 1; return;
+#endif
+    bool split_ok = fields_from_cols<7>(p, len, cols, f);
+    PROBE_END(a0, 10);
+    if (!split_ok || f[0].n == 0) {
         ++td.bad_lines;
         return;
     }
     ++td.event_lines;
     E1 r;
+    PROBE_BEGIN(a1);
     r.ev = make_key(f[0].p, f[0].n);
     i64 ts = NO_TIME, ing;
+#ifdef ABL_NOTS
+    bool ts_ok = true; ts = f[2].n; ing = f[3].n;
+#else
     bool ts_ok = parse_ts(f[2].p, f[2].n, ts) && ts >= c.window.start && ts < c.window.end;
-    if (!parse_ingest_f1(f[3].p, f[3].n, ing)) ing = NO_TIME;
+    if (!parse_ts(f[3].p, f[3].n, ing)) ing = NO_TIME;
+#endif
+    PROBE_END(a1, 11);
+    PROBE_BEGIN(a2);
     u32 kind = 0, price = 0;
-    const Field& ty = f[4];
-    if (ty.n == 4 && std::memcmp(ty.p, "view", 4) == 0) kind = 1;
-    else if (ty.n == 4 && std::memcmp(ty.p, "cart", 4) == 0) kind = 2;
-    else if (ty.n == 8 && std::memcmp(ty.p, "purchase", 8) == 0) {
-        kind = 3;
-        if (!parse_price(f[6].p, f[6].n, price)) kind = 0;
+    {
+        // Event type without branches: the type is one of three words in random order.
+        const Field& ty = f[4];
+        u32 w0, w1;
+        std::memcpy(&w0, ty.p, 4);
+        std::memcpy(&w1, ty.p + 4, 4);
+        constexpr u32 VIEW = 'v' | 'i' << 8 | 'e' << 16 | (u32)'w' << 24;
+        constexpr u32 CART = 'c' | 'a' << 8 | 'r' << 16 | (u32)'t' << 24;
+        constexpr u32 PURC = 'p' | 'u' << 8 | 'r' << 16 | (u32)'c' << 24;
+        constexpr u32 HASE = 'h' | 'a' << 8 | 's' << 16 | (u32)'e' << 24;
+        const u32 is_view = (ty.n == 4) & (w0 == VIEW);
+        const u32 is_cart = (ty.n == 4) & (w0 == CART);
+        const u32 is_buy = (ty.n == 8) & (w0 == PURC) & (w1 == HASE);
+        kind = is_view + 2 * is_cart + 3 * is_buy;
+        if (is_buy && !parse_price(f[6].p, f[6].n, price)) kind = 0;
     }
     bool valid = f[1].n && f[5].n && kind && ts_ok && ing != NO_TIME && ing - ts <= DAY_MS;
     r.ingest = ing;
@@ -85,12 +108,19 @@ inline void parse_event_line(const char* p, size_t len, ThreadData& td, const In
         }
         r.pay = (u64)price | ((u64)kind << 24) | PAY_VALID | ((u64)cat << 32);
     }
+    PROBE_END(a2, 12);
+    PROBE_BEGIN(a3);
+#ifdef ABL_NOSHUF
+    td.event_lines += (r.ev.a ^ r.ts ^ r.pay ^ r.user.a) & 1;
+#else
     *td.s1[part_of(hash_key(r.ev), c.p1_bits)].alloc(td.pool) = r;
+#endif
+    PROBE_END(a3, 13);
 }
 
-inline void parse_link_line(const char* p, size_t len, ThreadData& td) {
+inline void parse_link_line(const char* p, size_t len, const Cols<2>& cols, ThreadData& td) {
     Field f[2];
-    if (!split_line<2>(p, len, f) || f[0].n == 0 || f[1].n == 0) {
+    if (!fields_from_cols<2>(p, len, cols, f) || f[0].n == 0 || f[1].n == 0) {
         ++td.link_bad;
         return;
     }
@@ -104,10 +134,12 @@ struct ClickTmp {
     u32 camp;
 };
 
-inline void parse_click_line(const char* p, size_t len, ThreadData& td, const IngestContext& c,
-                             std::vector<ClickTmp>& out) {
+inline void parse_click_line(const char* p, size_t len, const Cols<4>& cols, ThreadData& td,
+                             const IngestContext& c, std::vector<ClickTmp>& out) {
     Field f[4];
-    if (!split_line<4>(p, len, f) || f[0].n == 0) {
+    PROBE_BEGIN(b0);
+    bool split_ok = fields_from_cols<4>(p, len, cols, f);
+    if (!split_ok || f[0].n == 0) {
         ++td.click_bad;
         return;
     }
@@ -124,6 +156,7 @@ inline void parse_click_line(const char* p, size_t len, ThreadData& td, const In
     t.ts = ts;
     t.camp = camp;
     out.push_back(t);
+    PROBE_END(b0, 14);
 }
 
 inline Key person_key(const LinkDict& dict, const Key& user, u64 h) {
@@ -133,6 +166,7 @@ inline Key person_key(const LinkDict& dict, const Key& user, u64 h) {
 
 // Resolves clicks to persons (prefetching dictionary slots) and shuffles them.
 inline void emit_clicks(ThreadData& td, const IngestContext& c, std::vector<ClickTmp>& tmp) {
+    PROBE_BEGIN(b1);
     constexpr size_t PF = 12;
     for (size_t i = 0; i < tmp.size(); ++i) {
         if (i + PF < tmp.size()) __builtin_prefetch(c.dict->slot_address(tmp[i + PF].h));
@@ -147,61 +181,94 @@ inline void emit_clicks(ThreadData& td, const IngestContext& c, std::vector<Clic
         ++td.click_valid;
     }
     tmp.clear();
+    PROBE_END(b1, 15);
 }
 
 // Per-thread scratch for the dedup stage.
+struct KI {
+    u64 a, b;
+    i64 ingest;
+};
 struct DedupScratch {
-    std::vector<E1> rows;
-    std::vector<u32> table, keep;
-    std::vector<u64> hashes;
+    std::vector<KI> ki;
+    std::vector<u32> table;
+    std::vector<u8> win;
 };
 
 // Dedups one event-hash partition (earliest ingest wins) and forwards the
-// valid survivors, keyed by person, to the person shuffle.
+// valid survivors, keyed by person, to the person shuffle. Rows are read in
+// place from the shuffle blocks; no partition-sized copy is made.
 inline void dedup_partition(u32 part, std::vector<ThreadData>& all, ThreadData& me, DedupScratch& sc,
                             const IngestContext& c) {
     size_t n = 0;
     for (auto& t : all) n += t.s1[part].size();
-    sc.rows.clear();
-    sc.rows.reserve(n);
-    for (auto& t : all) t.s1[part].drain_into(sc.rows, me.pool);
     if (n == 0) return;
+    PROBE_BEGIN(p0);
+    sc.ki.resize(n);
+    sc.win.assign(n, 0);
+    u8* win = sc.win.data();
     u32 cap = ceil_pow2(std::max<size_t>(n * 2, 16));
     sc.table.assign(cap, NONE32);
     const u32 mask = cap - 1;
-    for (u32 i = 0; i < n; ++i) {
-        const E1& r = sc.rows[i];
-        size_t s = hash_key(r.ev) & mask;
-        for (;;) {
-            u32 t = sc.table[s];
-            if (t == NONE32) {
-                sc.table[s] = i;
-                break;
+    u32* table = sc.table.data();
+    KI* ki = sc.ki.data();
+    size_t i = 0;
+    for (auto& t : all)
+        t.s1[part].for_each_block([&](const E1* b, size_t cnt) {
+            for (size_t j = 0; j < cnt; ++j, ++i) {
+                const E1& r = b[j];
+                ki[i] = KI{r.ev.a, r.ev.b, r.ingest};
+                size_t s = hash_key(r.ev) & mask;
+                for (;;) {
+                    u32 t0 = table[s];
+                    if (t0 == NONE32) {
+                        table[s] = (u32)i;
+                        win[i] = 1;
+                        ++me.events_unique;
+                        break;
+                    }
+                    if (ki[t0].a == r.ev.a && ki[t0].b == r.ev.b) {
+                        if (r.ingest < ki[t0].ingest) {
+                            table[s] = (u32)i;
+                            win[t0] = 0;
+                            win[i] = 1;
+                        }
+                        break;
+                    }
+                    s = (s + 1) & mask;
+                }
             }
-            if (sc.rows[t].ev == r.ev) {
-                if (r.ingest < sc.rows[t].ingest) sc.table[s] = i;
-                break;
-            }
-            s = (s + 1) & mask;
-        }
-    }
-    sc.keep.clear();
-    for (u32 t : sc.table)
-        if (t != NONE32) {
-            ++me.events_unique;
-            if (sc.rows[t].pay & PAY_VALID) sc.keep.push_back(t);
-        }
-    me.events_valid += sc.keep.size();
-    sc.hashes.resize(sc.keep.size());
-    for (size_t j = 0; j < sc.keep.size(); ++j) sc.hashes[j] = hash_key(sc.rows[sc.keep[j]].user);
-    constexpr size_t PF = 12;
-    for (size_t j = 0; j < sc.keep.size(); ++j) {
-        if (j + PF < sc.keep.size()) __builtin_prefetch(c.dict->slot_address(sc.hashes[j + PF]));
-        const E1& r = sc.rows[sc.keep[j]];
-        Key pk = person_key(*c.dict, r.user, sc.hashes[j]);
+        });
+    PROBE_END(p0, 0);
+    PROBE_BEGIN(p2);
+    // Forward valid winners; dictionary slots are prefetched a few rows ahead.
+    constexpr size_t PF = 16;
+    struct Pending {
+        const E1* r;
+        u64 h;
+    } ring[PF];
+    size_t k = 0;
+    auto emit = [&](const Pending& p) {
+        Key pk = person_key(*c.dict, p.r->user, p.h);
         E2* o = me.s2e[part_of(hash_key(pk), c.p2_bits)].alloc(me.pool);
         o->pk = pk;
-        o->ts = r.ts;
-        o->pay = r.pay;
-    }
+        o->ts = p.r->ts;
+        o->pay = p.r->pay;
+    };
+    i = 0;
+    for (auto& t : all)
+        t.s1[part].for_each_block([&](const E1* b, size_t cnt) {
+            for (size_t j = 0; j < cnt; ++j, ++i) {
+                if (!win[i] || !(b[j].pay & PAY_VALID)) continue;
+                u64 h = hash_key(b[j].user);
+                __builtin_prefetch(c.dict->slot_address(h));
+                if (k >= PF) emit(ring[k % PF]);
+                ring[k % PF] = Pending{&b[j], h};
+                ++k;
+            }
+        });
+    for (size_t m = k > PF ? k - PF : 0; m < k; ++m) emit(ring[m % PF]);
+    me.events_valid += k;
+    for (auto& t : all) t.s1[part].release(me.pool);
+    PROBE_END(p2, 2);
 }

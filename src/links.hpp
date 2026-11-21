@@ -5,6 +5,7 @@
 
 #include "csv.hpp"
 #include "key.hpp"
+#include "shuffle.hpp"
 
 struct LinkPair {
     Key a, b;
@@ -28,7 +29,8 @@ public:
         return &p.slots[h & p.mask];
     }
     // Smallest ID (byte-wise) of the linked person with this root.
-    const Key& name_of(u32 root) const { return keys_[min_of_root_[root]]; }
+    const Key& name_of(u32 root) const { return name_[root]; }
+    const void* name_address(u32 root) const { return &name_[root]; }
     size_t ids() const { return keys_.size(); }
     size_t persons() const { return persons_; }
 
@@ -41,7 +43,7 @@ private:
         u32 root = NONE32;
     };
     struct Part {
-        std::vector<Slot> slots;
+        Slot* slots = nullptr;  // carved out of one shared huge-page region
         size_t mask = 0;
         std::vector<Key> keys;  // distinct keys in local id order
         u32 base = 0;
@@ -49,7 +51,7 @@ private:
     u32 qbits_ = 0;
     std::vector<Part> parts_;
     std::vector<Key> keys_;           // all distinct IDs by handle
-    std::vector<u32> min_of_root_;    // root handle -> handle of smallest ID
+    std::vector<Key> name_;           // root handle -> smallest ID of the person
     size_t persons_ = 0;
 
     u32 local_id(const Part& p, const Key& k, u64 h) const {
@@ -80,13 +82,26 @@ inline void LinkDict::build(std::vector<std::vector<LinkPair>>& per_thread, int 
     });
 
     // 2. Build each partition's table independently.
+    // Table sizes first, so all tables can live in a single region.
+    {
+        size_t total_slots = 0;
+        for (u32 q = 0; q < Q; ++q) {
+            size_t n = 0;
+            for (int t = 0; t < T; ++t) n += scatter[(size_t)t * Q + q].size();
+            u32 cap = ceil_pow2(std::max<size_t>(n * 2, 16));
+            parts_[q].mask = cap - 1;
+            total_slots += cap;
+        }
+        Slot* region = (Slot*)huge_region(total_slots * sizeof(Slot));
+        size_t at = 0;
+        for (u32 q = 0; q < Q; ++q) {
+            parts_[q].slots = region + at;
+            at += parts_[q].mask + 1;
+        }
+    }
     parallel_jobs(threads, Q, [&](int, size_t q) {
         Part& p = parts_[q];
-        size_t n = 0;
-        for (int t = 0; t < T; ++t) n += scatter[(size_t)t * Q + q].size();
-        u32 cap = ceil_pow2(std::max<size_t>(n * 2, 16));
-        p.slots.assign(cap, Slot{});
-        p.mask = cap - 1;
+        for (size_t i = 0; i <= p.mask; ++i) p.slots[i] = Slot{};
         for (int t = 0; t < T; ++t) {
             for (const Key& k : scatter[(size_t)t * Q + q]) {
                 u64 h = hash_key(k);
@@ -157,12 +172,13 @@ inline void LinkDict::build(std::vector<std::vector<LinkPair>>& per_thread, int 
 
     // 5. Flatten roots and pick the byte-wise smallest ID per person.
     std::vector<u32> root(H);
-    min_of_root_.assign(H, NONE32);
+    std::vector<u32> min_of_root(H, NONE32);
+    name_.resize(H);
     persons_ = 0;
     for (u32 h = 0; h < H; ++h) {
         u32 r = find(h);
         root[h] = r;
-        u32& m = min_of_root_[r];
+        u32& m = min_of_root[r];
         if (m == NONE32) {
             m = h;
             ++persons_;
@@ -170,10 +186,14 @@ inline void LinkDict::build(std::vector<std::vector<LinkPair>>& per_thread, int 
             m = h;
         }
     }
+    for (u32 h = 0; h < H; ++h)
+        if (root[h] == h) name_[h] = keys_[min_of_root[h]];
     parallel_jobs(threads, Q, [&](int, size_t q) {
         Part& p = parts_[q];
-        for (Slot& s : p.slots)
+        for (size_t i = 0; i <= p.mask; ++i) {
+            Slot& s = p.slots[i];
             if (s.id != NONE32) s.root = root[p.base + s.id];
+        }
         std::vector<Key>().swap(p.keys);
     });
 }
